@@ -18,19 +18,16 @@ default_args = {
 
 @task
 def extract_spotify():
-    """
-    Read Spotify config from Airflow Variable,
-    get token, and fetch track search results.
-    """
     spotify_config = Variable.get("spotify_config", deserialize_json=True)
 
     client_id = spotify_config["client_id"]
     client_secret = spotify_config["client_secret"]
     token_url = spotify_config["token_url"]
     base_url = spotify_config["base_url"]
-    query = spotify_config["query"]
+    queries = spotify_config["queries"]
     search_type = spotify_config["type"]
     limit = spotify_config["limit"]
+    offsets = spotify_config.get("offsets", [0])
 
     auth_str = f"{client_id}:{client_secret}"
     b64_auth = base64.b64encode(auth_str.encode()).decode()
@@ -47,47 +44,57 @@ def extract_spotify():
     if not token:
         raise ValueError("Spotify token not received.")
 
-    response = requests.get(
-        f"{base_url}/search",
-        headers={"Authorization": f"Bearer {token}"},
-        params={
-            "q": query,
-            "type": search_type,
-            "limit": limit,
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
+    all_items = []
 
-    payload = response.json()
+    for query in queries:
+        for offset in offsets:
+            response = requests.get(
+                f"{base_url}/search",
+                headers={"Authorization": f"Bearer {token}"},
+                params={
+                    "q": query,
+                    "type": search_type,
+                    "limit": limit,
+                    "offset": offset,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
 
-    if "tracks" not in payload:
-        raise ValueError(f"Unexpected Spotify response: {payload}")
+            payload = response.json()
+            items = payload.get("tracks", {}).get("items", [])
 
-    return payload
+            for item in items:
+                item["_query_term"] = query
+
+            all_items.extend(items)
+
+    if not all_items:
+        raise ValueError("No Spotify items were returned.")
+
+    return {"tracks": {"items": all_items}}
 
 
 @task
 def transform_spotify(raw_data: dict):
-    """
-    Transform Spotify API response into normalized records.
-    """
-    spotify_config = Variable.get("spotify_config", deserialize_json=True)
-    query = spotify_config["query"]
-
     utc_now = datetime.utcnow()
     fetched_at = utc_now.strftime("%Y-%m-%d %H:%M:%S")
     snapshot_date = utc_now.strftime("%Y-%m-%d")
 
     items = raw_data.get("tracks", {}).get("items", [])
+    deduped = {}
+    for item in items:
+        track_id = item.get("id")
+        if track_id and track_id not in deduped:
+            deduped[track_id] = item
 
     records = []
-    for item in items:
+    for item in deduped.values():
         artists = item.get("artists", [])
         first_artist = artists[0] if artists else {}
 
         records.append({
-            "query_term": query,
+            "query_term": item.get("_query_term"),
             "track_id": item.get("id"),
             "track_name": item.get("name"),
             "artist_id": first_artist.get("id"),
@@ -104,11 +111,14 @@ def transform_spotify(raw_data: dict):
     return records
 
 
+
 @task
 def load_to_snowflake(records: list[dict]):
     """
-    Idempotent daily load:
-    delete today's partition for the query, then insert today's records.
+    Idempotent daily load for multi-query Spotify ingestion.
+    For each (query_term, snapshot_date) partition:
+      - delete existing rows
+      - insert fresh rows
     """
     hook = SnowflakeHook(snowflake_conn_id="snowflake_music_conn")
     conn = hook.get_conn()
@@ -133,15 +143,20 @@ def load_to_snowflake(records: list[dict]):
             )
         """)
 
-        query_term = records[0]["query_term"]
-        snapshot_date = records[0]["snapshot_date"]
+        # delete existing partitions for this batch
+        partitions = sorted({
+            (record["query_term"], record["snapshot_date"])
+            for record in records
+        })
 
         delete_sql = f"""
             DELETE FROM {target_table}
             WHERE query_term = %s
               AND snapshot_date = %s
         """
-        cur.execute(delete_sql, (query_term, snapshot_date))
+
+        for query_term, snapshot_date in partitions:
+            cur.execute(delete_sql, (query_term, snapshot_date))
 
         insert_sql = f"""
             INSERT INTO {target_table}
@@ -179,12 +194,12 @@ def load_to_snowflake(records: list[dict]):
         cur.execute("COMMIT;")
         print(
             f"Inserted {len(records)} records into {target_table} "
-            f"for query_term={query_term}, snapshot_date={snapshot_date}"
+            f"for {len(partitions)} partition(s)"
         )
 
     except Exception as e:
         cur.execute("ROLLBACK;")
-        print(e)
+        print(f"Load failed: {e}")
         raise
 
     finally:
