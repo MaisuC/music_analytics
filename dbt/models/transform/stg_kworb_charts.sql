@@ -1,0 +1,22 @@
+select
+    market,
+    chart_type,
+    rank::number as rank,
+    rank_change,
+    artist_and_title,
+    trim(artist_name) as artist_name,
+    trim(track_name) as track_name,
+    days_on_chart::number as days_on_chart,
+    peak_rank::number as peak_rank,
+    multiplier,
+    try_to_number(replace(streams, ',', '')) as streams,
+    streams_change,
+    try_to_number(replace(seven_day, ',', '')) as seven_day,
+    seven_day_change,
+    try_to_number(replace(total_streams, ',', '')) as total_streams,
+    source_url,
+    row_link,
+    ingested_date::date as ingested_date,
+    ingested_at::timestamp_ntz as ingested_at,
+    raw_row_json
+from {{ source('raw', 'raw_kworb_charts') }}
