@@ -1,0 +1,13 @@
+music_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "EAB27764"
+      user: "BEETLE"
+      password: "CherylMatt1221"
+      role: "TRAINING_ROLE"
+      database: "MUSIC_ANALYTICS_DB"
+      warehouse: "BEETLE_QUERY_WH"
+      schema: "ELT"
+      threads: 1
